@@ -50,6 +50,13 @@ from turboquant.runtime.kv_capture import (
     save_past_key_values,
     summarize_past_key_values,
 )
+from turboquant.runtime.memory_accounting import (
+    gpu_current_memory_bytes,
+    gpu_peak_memory_bytes,
+    past_key_values_memory_breakdown,
+    turboquant_mse_packed_bytes,
+)
+from turboquant.runtime.packed_qmse_cache import build_packed_mse_cache, packed_cache_storage_breakdown
 from turboquant.runtime.experiment_log import log_experiment_event
 from turboquant.runtime.metadata import ensure_dir, resolve_run_name, utc_timestamp, write_json
 from turboquant.runtime.query_capture import capture_query_projections, save_query_projections
@@ -125,9 +132,18 @@ def _score_sort_key(item: dict[str, object]) -> tuple[int, float]:
     return (int(item["context_length"]), float(item["depth_percent"]))
 
 
+def _mean_or_none(values: list[int | float | None]) -> float | None:
+    present = [float(item) for item in values if item is not None]
+    if not present:
+        return None
+    return sum(present) / len(present)
+
+
 def _validate_niah_variant(variant: str) -> None:
-    if variant not in {"baseline", "qmse"}:
-        raise ValueError(f"Unsupported NIAH variant={variant!r}. Choose from ['baseline', 'qmse'].")
+    if variant not in {"baseline", "qmse", "qmse_packed"}:
+        raise ValueError(
+            f"Unsupported NIAH variant={variant!r}. Choose from ['baseline', 'qmse', 'qmse_packed']."
+        )
 
 
 def _eos_token_ids(model, tokenizer) -> set[int]:
@@ -149,7 +165,7 @@ def _greedy_decode_with_prefill_cache(
     variant: str,
     qmse_bits: int,
     rotation_seed: int,
-) -> tuple[str, float, float]:
+) -> tuple[str, float, float, dict[str, object]]:
     import torch
 
     if max_new_tokens <= 0:
@@ -162,6 +178,16 @@ def _greedy_decode_with_prefill_cache(
     with torch.inference_mode():
         outputs = model(**inputs, use_cache=True)
         past_key_values = outputs.past_key_values
+        dense_breakdown = past_key_values_memory_breakdown(past_key_values)
+        packed_estimate = (
+            turboquant_mse_packed_bytes(
+                num_vectors_per_kind=dense_breakdown["num_key_value_vectors_per_kind"],
+                vector_dimension=dense_breakdown["vector_dimension"],
+                bits=qmse_bits,
+            )
+            if variant in {"qmse", "qmse_packed"}
+            else None
+        )
         if variant == "qmse":
             quant_started = time.monotonic()
             past_key_values = quantize_past_key_values_mse(
@@ -170,10 +196,33 @@ def _greedy_decode_with_prefill_cache(
                 seed=rotation_seed,
             )
             quantization_seconds += time.monotonic() - quant_started
+            packed_actual = None
+        elif variant == "qmse_packed":
+            quant_started = time.monotonic()
+            packed_cache = build_packed_mse_cache(
+                past_key_values,
+                bits=qmse_bits,
+                seed=rotation_seed,
+            )
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            del past_key_values
+            del outputs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            past_key_values = packed_cache
+            packed_actual = packed_cache_storage_breakdown(packed_cache)
+            quantization_seconds += time.monotonic() - quant_started
+        else:
+            packed_actual = None
 
-        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        if variant != "qmse_packed":
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated_tokens = [next_token]
         attention_mask = inputs.get("attention_mask")
+
+        post_cache_setup = gpu_current_memory_bytes()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         for _ in range(max_new_tokens - 1):
             if eos_token_ids and int(next_token[0, 0].item()) in eos_token_ids:
@@ -212,7 +261,13 @@ def _greedy_decode_with_prefill_cache(
     completion_tokens = torch.cat(generated_tokens, dim=-1)
     response_text = tokenizer.decode(completion_tokens[0], skip_special_tokens=True).strip()
     generation_seconds = time.monotonic() - decode_started
-    return response_text, generation_seconds, quantization_seconds
+    return response_text, generation_seconds, quantization_seconds, {
+        "prefill_cache": dense_breakdown,
+        "turboquant_mse_packed_estimate": packed_estimate,
+        "turboquant_mse_packed_actual": packed_actual,
+        "post_cache_setup_gpu_memory": post_cache_setup,
+        "gpu_peak_memory": gpu_peak_memory_bytes(),
+    }
 
 
 def _run_niah_case_impl(
@@ -267,8 +322,9 @@ def _run_niah_case_impl(
     prompt_tokens = int(inputs["input_ids"].shape[-1])
     if torch.cuda.is_available():
         inputs = {name: tensor.to("cuda") for name, tensor in inputs.items()}
+        torch.cuda.reset_peak_memory_stats()
 
-    response_text, generation_seconds, quantization_seconds = _greedy_decode_with_prefill_cache(
+    response_text, generation_seconds, quantization_seconds, memory_metrics = _greedy_decode_with_prefill_cache(
         model=model,
         tokenizer=tokenizer,
         inputs=inputs,
@@ -292,14 +348,15 @@ def _run_niah_case_impl(
         "prompt_tokens": prompt_tokens,
         "generation_seconds": round(generation_seconds, 4),
         "quantization_seconds": round(quantization_seconds, 4),
-        "qmse_bits": qmse_bits if variant == "qmse" else None,
-        "rotation_seed": rotation_seed if variant == "qmse" else None,
+        "qmse_bits": qmse_bits if variant in {"qmse", "qmse_packed"} else None,
+        "rotation_seed": rotation_seed if variant in {"qmse", "qmse_packed"} else None,
         "decoder_mode": "manual_greedy_prefill_cache",
         "cache_quantization_scope": (
             "prefill_full_cache_and_incremental_generated_tail"
             if variant == "qmse"
             else "none"
         ),
+        "memory_metrics": memory_metrics,
         "needle_key": needle.key,
         "score": score,
         "context_meta": context_meta,
@@ -323,7 +380,30 @@ def _run_niah_case_impl(
             "exact_match": score["exact_match"],
             "generation_seconds": round(generation_seconds, 4),
             "quantization_seconds": round(quantization_seconds, 4),
-            "qmse_bits": qmse_bits if variant == "qmse" else None,
+            "qmse_bits": qmse_bits if variant in {"qmse", "qmse_packed"} else None,
+            "prefill_dense_kv_bytes": memory_metrics["prefill_cache"]["dense_kv_bytes"],
+            "prefill_packed_estimate_bytes": (
+                memory_metrics["turboquant_mse_packed_estimate"]["packed_kv_bytes"]
+                if memory_metrics["turboquant_mse_packed_estimate"] is not None
+                else None
+            ),
+            "prefill_packed_actual_bytes": (
+                memory_metrics["turboquant_mse_packed_actual"]["packed_total_bytes"]
+                if memory_metrics["turboquant_mse_packed_actual"] is not None
+                else None
+            ),
+            "post_cache_setup_allocated_bytes": (
+                memory_metrics["post_cache_setup_gpu_memory"]["allocated_bytes"]
+                if memory_metrics["post_cache_setup_gpu_memory"] is not None
+                else None
+            ),
+            "post_cache_setup_reserved_bytes": (
+                memory_metrics["post_cache_setup_gpu_memory"]["reserved_bytes"]
+                if memory_metrics["post_cache_setup_gpu_memory"] is not None
+                else None
+            ),
+            "gpu_peak_allocated_bytes": memory_metrics["gpu_peak_memory"]["peak_allocated_bytes"],
+            "gpu_peak_reserved_bytes": memory_metrics["gpu_peak_memory"]["peak_reserved_bytes"],
             "metadata_path": str(metadata_path),
             "response_path": str(response_path),
         },
@@ -340,7 +420,8 @@ def _run_niah_case_impl(
         "exact_match": score["exact_match"],
         "response_text": response_text,
         "quantization_seconds": round(quantization_seconds, 4),
-        "qmse_bits": qmse_bits if variant == "qmse" else None,
+        "qmse_bits": qmse_bits if variant in {"qmse", "qmse_packed"} else None,
+        "memory_metrics": memory_metrics,
         "metadata_path": str(metadata_path),
         "log_path": str(log_path),
     }
@@ -878,8 +959,8 @@ def run_niah_grid(
         "run_name": grid_name,
         "benchmark": "niah",
         "variant": variant,
-        "qmse_bits": qmse_bits if variant == "qmse" else None,
-        "rotation_seed": rotation_seed if variant == "qmse" else None,
+        "qmse_bits": qmse_bits if variant in {"qmse", "qmse_packed"} else None,
+        "rotation_seed": rotation_seed if variant in {"qmse", "qmse_packed"} else None,
         "num_cases": len(results),
         "context_lengths": lengths,
         "depth_percents": depths,
@@ -896,8 +977,8 @@ def run_niah_grid(
             "run_name": grid_name,
             "benchmark": "niah",
             "variant": variant,
-            "qmse_bits": qmse_bits if variant == "qmse" else None,
-            "rotation_seed": rotation_seed if variant == "qmse" else None,
+            "qmse_bits": qmse_bits if variant in {"qmse", "qmse_packed"} else None,
+            "rotation_seed": rotation_seed if variant in {"qmse", "qmse_packed"} else None,
             "context_lengths": lengths,
             "depth_percents": depths,
             "num_cases": len(results),
@@ -951,6 +1032,33 @@ def compare_niah_grids(baseline_run_name: str, candidate_run_name: str) -> dict[
             }
         )
 
+    baseline_dense_bytes = [item.get("memory_metrics", {}).get("prefill_cache", {}).get("dense_kv_bytes") for item in baseline_results]
+    candidate_dense_bytes = [item.get("memory_metrics", {}).get("prefill_cache", {}).get("dense_kv_bytes") for item in candidate_results]
+    candidate_packed_bytes = [
+        item.get("memory_metrics", {}).get("turboquant_mse_packed_estimate", {}).get("packed_kv_bytes")
+        for item in candidate_results
+    ]
+    baseline_peak_allocated = [
+        item.get("memory_metrics", {}).get("gpu_peak_memory", {}).get("peak_allocated_bytes")
+        for item in baseline_results
+    ]
+    candidate_peak_allocated = [
+        item.get("memory_metrics", {}).get("gpu_peak_memory", {}).get("peak_allocated_bytes")
+        for item in candidate_results
+    ]
+    baseline_setup_allocated = [
+        item.get("memory_metrics", {}).get("post_cache_setup_gpu_memory", {}).get("allocated_bytes")
+        for item in baseline_results
+    ]
+    candidate_setup_allocated = [
+        item.get("memory_metrics", {}).get("post_cache_setup_gpu_memory", {}).get("allocated_bytes")
+        for item in candidate_results
+    ]
+    candidate_packed_actual = [
+        item.get("memory_metrics", {}).get("turboquant_mse_packed_actual", {}).get("packed_total_bytes")
+        for item in candidate_results
+    ]
+
     return {
         "baseline_run_name": baseline_run_name,
         "candidate_run_name": candidate_run_name,
@@ -958,6 +1066,16 @@ def compare_niah_grids(baseline_run_name: str, candidate_run_name: str) -> dict[
         "candidate_variant": candidate.get("variant"),
         "baseline_exact_match_rate": baseline["exact_match_rate"],
         "candidate_exact_match_rate": candidate["exact_match_rate"],
+        "memory_summary": {
+            "baseline_mean_prefill_dense_kv_bytes": _mean_or_none(baseline_dense_bytes),
+            "candidate_mean_prefill_dense_kv_bytes": _mean_or_none(candidate_dense_bytes),
+            "candidate_mean_prefill_packed_estimate_bytes": _mean_or_none(candidate_packed_bytes),
+            "candidate_mean_prefill_packed_actual_bytes": _mean_or_none(candidate_packed_actual),
+            "baseline_mean_post_cache_setup_allocated_bytes": _mean_or_none(baseline_setup_allocated),
+            "candidate_mean_post_cache_setup_allocated_bytes": _mean_or_none(candidate_setup_allocated),
+            "baseline_mean_peak_allocated_bytes": _mean_or_none(baseline_peak_allocated),
+            "candidate_mean_peak_allocated_bytes": _mean_or_none(candidate_peak_allocated),
+        },
         "comparisons": comparisons,
     }
 

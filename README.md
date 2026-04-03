@@ -224,12 +224,25 @@ modal run src/turboquant/modal_app.py \
   --run-name niah-qmse-b3
 ```
 
+Run the packed-cache `Q_mse` `NIAH` grid that should impact runtime cache memory:
+
+```bash
+modal run src/turboquant/modal_app.py \
+  --niah-grid \
+  --context-lengths 4000,8000,16000,32000 \
+  --depth-percents 10,50,90 \
+  --variant qmse_packed \
+  --qmse-bits 3 \
+  --revision 976055f8c83f394f35dbd3ab09a285a984907bd0 \
+  --run-name niah-qmse-packed-b3
+```
+
 Compare the quantized `NIAH` grid against the baseline:
 
 ```bash
 modal run src/turboquant/modal_app.py \
   --compare-niah-baseline niah-baseline \
-  --compare-niah-candidate niah-qmse-b3
+  --compare-niah-candidate niah-qmse-packed-b3
 ```
 
 Important caution:
@@ -237,9 +250,10 @@ the upstream `Needle In A Haystack` repo is API-oriented. Our implementation mir
 official protocol locally for QwQ by varying context length, insertion depth, and deterministic
 retrieval scoring inside our own runtime, rather than calling the provider-specific upstream package.
 
-For NIAH, both `baseline` and `qmse` variants now use the same manual greedy decoding path after
-prefill so the only intended change is whether the cached KV tensors are reconstructed with
-`TurboQuant_mse`.
+For NIAH, all variants use the same manual greedy decoding path after prefill:
+- `baseline`: dense KV cache
+- `qmse`: reconstructed dense `TurboQuant_mse` cache
+- `qmse_packed`: packed `TurboQuant_mse` cache that dequantizes one layer at a time during attention
 
 ## Notes on authenticity
 
