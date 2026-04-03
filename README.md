@@ -1,31 +1,137 @@
-# turboquant
+# turboquant-modal
 
-TurboQuant replication workspace for `Qwen/QwQ-32B`, with Modal as the execution environment and official upstream benchmarks as the evaluation surface.
+Unofficial TurboQuant-style KV-cache compression for `Qwen/QwQ-32B` on Modal.
 
-## Principles
+This repo implements and evaluates the `TurboQuant_mse` path from the TurboQuant paper: normalize each KV vector, rotate it with a fixed orthogonal transform, quantize rotated coordinates with a Lloyd-Max scalar codebook, then inverse-rotate and rescale. It also includes a packed-cache runtime variant that stores quantized KV state in compressed form and dequantizes one layer at a time during attention.
 
-- Use the real Hugging Face weights from `Qwen/QwQ-32B`.
-- Use the real public benchmark repos and datasets first.
-- Keep `TurboQuant_mse` and `TurboQuant_prod` separate in the architecture.
-- Do not silently turn `Q_prod` into a merged KV vector.
-- Establish a clean baseline before adding any quantization logic.
+We intentionally do **not** claim the full paper is reproduced. The current implementation covers the `Q_mse` path, not the full `Q_prod` residual-QJL path or a fused custom kernel.
 
-## What is in this repo
+## What is implemented
 
-- [`RESEARCH.md`](/Users/eddie/Documents/turboquant/RESEARCH.md): paper notes, benchmark scope, and implementation caveats.
-- `src/turboquant/sources.py`: official source registry for the model, paper, and benchmarks.
-- `src/turboquant/modal_app.py`: Modal baseline app for `Qwen/QwQ-32B` on `H200`, `cpu=4`, `memory=16384`.
-- `src/turboquant/quantization/protocol.py`: quantization interfaces with a hard guardrail against unsafe `Q_prod` reconstruction.
-- `src/turboquant/runtime/kv_capture.py`: prompt-level KV extraction and per-layer norm summaries.
-- `src/turboquant/config.py`: pinned model revision and shared runtime constants.
+- Real `Qwen/QwQ-32B` loading on Modal with pinned Hugging Face revision.
+- Reference `TurboQuant_mse` math:
+  - exact coordinate density for a random point on the unit sphere
+  - numerical Lloyd-Max scalar codebook construction
+  - fixed seeded random orthogonal rotation
+  - vector normalization and norm rescaling
+- Offline KV capture and distortion analysis on real QwQ KV tensors.
+- Three NIAH runtime variants:
+  - `baseline`: dense KV cache
+  - `qmse`: dense reconstructed `TurboQuant_mse` cache
+  - `qmse_packed`: packed `TurboQuant_mse` cache that dequantizes one layer at a time during attention
+- Runtime memory accounting for:
+  - dense KV cache bytes
+  - packed KV payload bytes
+  - post-cache-setup GPU memory
+  - decode-time peak GPU memory
 
-## First milestones
+## Algorithm
 
-1. Verify baseline `Qwen/QwQ-32B` generation on Modal with the official weights.
-2. Run official `NIAH` and `LongBench` infrastructure without shortcuts.
-3. Add offline KV extraction and distortion analysis.
-4. Add `TurboQuant_mse` reference math.
-5. Add a custom attention path for `TurboQuant_prod`.
+For one KV vector `x ∈ R^d`:
+
+1. Compute the norm `||x||`.
+2. Normalize to `u = x / ||x||`.
+3. Apply a fixed random orthogonal rotation `R` to get `z = u R^T`.
+4. Quantize each coordinate of `z` independently with a Lloyd-Max scalar quantizer learned for the coordinate distribution of a random unit vector in dimension `d`.
+5. Inverse-rotate the quantized vector.
+6. Multiply by the stored norm.
+
+That is the core `Q_mse` path in [turboquant_mse.py](/Users/eddie/Documents/turboquant/src/turboquant/quantization/turboquant_mse.py).
+
+The packed runtime stores:
+
+- per-coordinate quantizer indices, bit-packed
+- one stored norm per KV vector
+
+That runtime path is implemented in [packed_qmse_cache.py](/Users/eddie/Documents/turboquant/src/turboquant/runtime/packed_qmse_cache.py).
+
+## Why `Q_mse` first
+
+The paper also describes `Q_prod`, which adds a residual 1-bit QJL sketch to improve inner-product estimation. We do **not** use that path yet, because:
+
+- `Q_prod` is not a generic reconstructed vector format
+- merging the residual correction back into a normal KV vector is known to be unsafe
+- the correct `Q_prod` path wants a custom attention-score implementation
+
+So this repo focuses on the safer, drop-in `Q_mse` path first.
+
+## Measured results
+
+Current tested setup:
+
+- model: `Qwen/QwQ-32B`
+- revision: `976055f8c83f394f35dbd3ab09a285a984907bd0`
+- runtime: Modal `H200`, `cpu=4`, `memory=16384`
+- attention backend: `sdpa`
+- benchmark: local NIAH protocol aligned to the official benchmark structure
+
+### Validation matrix
+
+- Offline vector fidelity:
+  - captured real KV tensors from `QwQ-32B`
+  - ran `2/3/4`-bit `TurboQuant_mse` sweeps
+  - checked cosine, MSE, and actual-query causal logit error
+- Live benchmark parity:
+  - `baseline` vs `qmse`
+  - `baseline` vs `qmse_packed`
+  - NIAH grid at `4000, 8000, 16000, 32000` tokens and `10%, 50%, 90%` depths
+- Runtime memory accounting:
+  - dense KV payload bytes
+  - packed KV payload bytes
+  - post-cache-setup GPU memory
+  - decode-time peak GPU memory
+
+### Offline KV analysis
+
+On captured QwQ KV tensors, the `TurboQuant_mse` bit sweep behaved sensibly:
+
+- `2-bit`: visibly lossy
+- `3-bit`: promising
+- `4-bit`: near-transparent
+
+Across multiple captured prompts, `3-bit` reconstruction stayed around `~0.983` mean cosine for both keys and values, with key-side actual-query causal logit error still in a plausible range.
+
+### Live NIAH results
+
+For NIAH at context lengths `4000, 8000, 16000, 32000` and insertion depths `10%, 50%, 90%`:
+
+- `baseline`: `100%` exact match
+- `qmse`: `100%` exact match
+- `qmse_packed`: `100%` exact match
+
+### Runtime memory results
+
+On the packed runtime path (`qmse_packed`, `3-bit`), the measured cache payload shrank from roughly:
+
+- dense KV cache: `~3.98 GB`
+- packed KV payload: `~778 MB`
+
+That is about an `80.4%` reduction in KV payload size.
+
+Preliminary runtime profiling also showed materially lower global GPU memory:
+
+- post-cache-setup allocated memory dropped by about `7-8 GB`
+- decode-time peak allocated memory dropped by about `~6.9 GB`
+
+The payload-byte result is the strongest claim here. The global GPU-memory deltas are real profiling outputs from the packed runtime, but they should still be treated as runtime measurements rather than a final kernel-optimized number.
+
+## What this repo does **not** prove yet
+
+- It does not implement the full `Q_prod` path.
+- It does not include a fused Triton/CUDA attention kernel.
+- It does not yet claim broad benchmark parity beyond NIAH.
+- It does not yet claim ultra-long-context results beyond the tested runtime/model setup.
+
+This is best viewed today as a serious research implementation and packed-cache prototype, not a finished production library.
+
+## Project structure
+
+- [src/turboquant/quantization/turboquant_mse.py](/Users/eddie/Documents/turboquant/src/turboquant/quantization/turboquant_mse.py): reference `Q_mse` math
+- [src/turboquant/runtime/packed_qmse_cache.py](/Users/eddie/Documents/turboquant/src/turboquant/runtime/packed_qmse_cache.py): packed cache format and layer-local dequantization
+- [src/turboquant/runtime/memory_accounting.py](/Users/eddie/Documents/turboquant/src/turboquant/runtime/memory_accounting.py): cache byte accounting and GPU memory sampling
+- [src/turboquant/benchmarks/niah.py](/Users/eddie/Documents/turboquant/src/turboquant/benchmarks/niah.py): local NIAH protocol
+- [src/turboquant/modal_app.py](/Users/eddie/Documents/turboquant/src/turboquant/modal_app.py): Modal entrypoints for generation, KV capture, analysis, and NIAH
+- [RESEARCH.md](/Users/eddie/Documents/turboquant/RESEARCH.md): longer-form notes and caveats
 
 ## Install
 
@@ -35,171 +141,28 @@ source .venv/bin/activate
 uv pip install -e ".[benchmarks,modal,dev]"
 ```
 
-## Quick checks
-
-Show the pinned upstream sources:
-
-```bash
-turboquant sources
-```
-
-Run the Modal baseline app:
-
-```bash
-modal run src/turboquant/modal_app.py --prompt "Explain KV cache compression in one paragraph."
-```
-
-Warm the remote Modal weight cache without generating:
-
-```bash
-modal run src/turboquant/modal_app.py --prefetch-only
-```
-
-## Modal setup
-
-1. Install Modal locally:
-
-```bash
-uv tool install modal
-```
-
-2. Authenticate your local CLI with your Modal account:
+Authenticate Modal:
 
 ```bash
 modal setup
-```
-
-If that does not work, Modal's docs say `python -m modal setup` is the fallback.
-
-3. Verify the CLI can see your account:
-
-```bash
 modal token info
 ```
 
-4. Optionally set a Hugging Face token locally for more reliable model downloads:
+Optionally export a Hugging Face token locally:
 
 ```bash
 export HF_TOKEN=...
 ```
 
-The current Modal app automatically forwards a local `HF_TOKEN` into the remote container if it is set.
+## Reproduce
 
-5. Run the baseline remote generation job:
-
-```bash
-modal run src/turboquant/modal_app.py --prompt "Explain KV cache compression in one paragraph."
-```
-
-6. If you want to warm the cache first, do this once:
+Warm the model snapshot cache:
 
 ```bash
 modal run src/turboquant/modal_app.py --prefetch-only
 ```
 
-7. If you want to pin a specific Hugging Face revision:
-
-```bash
-modal run src/turboquant/modal_app.py --prompt "Say hello." --revision 976055f8c83f394f35dbd3ab09a285a984907bd0
-```
-
-The model weights are cached in a named Modal Volume so later runs do not need to re-download everything.
-
-## Tested baseline dependency set
-
-The current baseline is pinned to public stable releases checked on 2026-03-30:
-
-- `modal==1.3.5`
-- `torch==2.10.0`
-- `transformers==5.3.0`
-- `accelerate==1.13.0`
-- `huggingface_hub[hf_transfer]==1.6.0`
-- `safetensors==0.7.0`
-- `numpy==2.4.3`
-- `scipy==1.17.1`
-
-The baseline runtime intentionally uses `attn_implementation="sdpa"` instead of `flash_attention_2`.
-That avoids forcing an extra CUDA extension before we have a reason to install and validate it.
-
-## Paper-faithful workflow
-
-1. Prefetch and pin the exact `QwQ-32B` snapshot revision.
-2. Run a baseline generation and write metadata to the artifacts volume.
-3. Capture prompt KV tensors from the real model and store them as safetensors.
-4. Compare TurboQuant math against those real tensors before any custom kernel work.
-5. Only after the data pipeline is stable, wire in official `NIAH` and `LongBench-E` runs.
-
-Run a pinned baseline generation and write artifacts:
-
-```bash
-modal run src/turboquant/modal_app.py \
-  --revision 976055f8c83f394f35dbd3ab09a285a984907bd0 \
-  --run-name baseline-smoke \
-  --prompt "Summarize how KV-cache compression differs from weight quantization."
-```
-
-Capture real prompt KV tensors:
-
-```bash
-modal run src/turboquant/modal_app.py \
-  --revision 976055f8c83f394f35dbd3ab09a285a984907bd0 \
-  --capture-kv \
-  --run-name kv-smoke \
-  --prompt "Summarize how KV-cache compression differs from weight quantization."
-```
-
-Analyze the captured KV artifact with the paper-faithful `TurboQuant_mse` reference path:
-
-```bash
-modal run src/turboquant/modal_app.py \
-  --analyze-turboquant-mse kv-smoke \
-  --bits 3 \
-  --target both
-```
-
-Run a conservative bit sweep on the same captured artifact:
-
-```bash
-modal run src/turboquant/modal_app.py \
-  --analyze-turboquant-mse kv-smoke \
-  --bits-list 2,3,4 \
-  --target both
-```
-
-Capture a small built-in prompt suite for repeated offline analysis:
-
-```bash
-modal run src/turboquant/modal_app.py \
-  --capture-suite science_smoke \
-  --revision 976055f8c83f394f35dbd3ab09a285a984907bd0
-```
-
-Every capture and analysis run also appends a compact permanent record to:
-
-`/vol/artifacts/logs/experiment_log.jsonl`
-
-Important caution:
-the current `inner_product_mse` field in the TurboQuant MSE analysis is explicitly a
-`random_unit_query_proxy`, not yet a metric based on actual model query vectors.
-
-Print the paper-faithful benchmark manifest:
-
-```bash
-turboquant benchmarks
-```
-
-Run a single local `NIAH` case with deterministic scoring:
-
-```bash
-modal run src/turboquant/modal_app.py \
-  --niah-context-length 8000 \
-  --niah-depth-percent 50 \
-  --variant baseline \
-  --revision 976055f8c83f394f35dbd3ab09a285a984907bd0 \
-  --run-name niah-smoke
-```
-
-Run a small baseline `NIAH` grid within the current model limit:
+Run the baseline NIAH grid:
 
 ```bash
 modal run src/turboquant/modal_app.py \
@@ -207,24 +170,12 @@ modal run src/turboquant/modal_app.py \
   --context-lengths 4000,8000,16000,32000 \
   --depth-percents 10,50,90 \
   --variant baseline \
+  --max-new-tokens 256 \
   --revision 976055f8c83f394f35dbd3ab09a285a984907bd0 \
   --run-name niah-baseline
 ```
 
-Run the first live `Q_mse` `NIAH` grid:
-
-```bash
-modal run src/turboquant/modal_app.py \
-  --niah-grid \
-  --context-lengths 4000,8000,16000,32000 \
-  --depth-percents 10,50,90 \
-  --variant qmse \
-  --qmse-bits 3 \
-  --revision 976055f8c83f394f35dbd3ab09a285a984907bd0 \
-  --run-name niah-qmse-b3
-```
-
-Run the packed-cache `Q_mse` `NIAH` grid that should impact runtime cache memory:
+Run the packed `3-bit` NIAH grid:
 
 ```bash
 modal run src/turboquant/modal_app.py \
@@ -233,11 +184,12 @@ modal run src/turboquant/modal_app.py \
   --depth-percents 10,50,90 \
   --variant qmse_packed \
   --qmse-bits 3 \
+  --max-new-tokens 256 \
   --revision 976055f8c83f394f35dbd3ab09a285a984907bd0 \
   --run-name niah-qmse-packed-b3
 ```
 
-Compare the quantized `NIAH` grid against the baseline:
+Compare them:
 
 ```bash
 modal run src/turboquant/modal_app.py \
@@ -245,24 +197,19 @@ modal run src/turboquant/modal_app.py \
   --compare-niah-candidate niah-qmse-packed-b3
 ```
 
-Important caution:
-the upstream `Needle In A Haystack` repo is API-oriented. Our implementation mirrors the
-official protocol locally for QwQ by varying context length, insertion depth, and deterministic
-retrieval scoring inside our own runtime, rather than calling the provider-specific upstream package.
+If you want the offline KV analysis path as well:
 
-For NIAH, all variants use the same manual greedy decoding path after prefill:
-- `baseline`: dense KV cache
-- `qmse`: reconstructed dense `TurboQuant_mse` cache
-- `qmse_packed`: packed `TurboQuant_mse` cache that dequantizes one layer at a time during attention
+```bash
+modal run src/turboquant/modal_app.py \
+  --capture-kv \
+  --run-name kv-smoke \
+  --revision 976055f8c83f394f35dbd3ab09a285a984907bd0 \
+  --prompt "Summarize how KV-cache compression differs from weight quantization."
+```
 
-## Notes on authenticity
-
-This project is intentionally wired around official public sources:
-
-- model weights: [`Qwen/QwQ-32B`](https://huggingface.co/Qwen/QwQ-32B)
-- TurboQuant paper: [OpenReview](https://openreview.net/forum?id=tO3ASKZlok)
-- Needle In A Haystack: [official repo](https://github.com/gkamradt/LLMTest_NeedleInAHaystack)
-- LongBench: [official repo](https://github.com/THUDM/LongBench)
-- RULER: [official repo](https://github.com/NVIDIA/RULER)
-- LVEval: [official repo](https://github.com/infinigence/LVEval)
-- ZeroSCROLLS: [official repo](https://github.com/tau-nlp/zero_scrolls)
+```bash
+modal run src/turboquant/modal_app.py \
+  --analyze-turboquant-mse kv-smoke \
+  --bits-list 2,3,4 \
+  --target both
+```

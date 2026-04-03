@@ -32,7 +32,6 @@ from turboquant.config import (
     resolve_revision,
 )
 from turboquant.modeling.qwq import QwQLoadConfig, load_qwq_model
-from turboquant.prompt_suites import get_prompt_suite
 from turboquant.quantization.attention_metrics import causal_attention_logit_mse
 from turboquant.quantization.turboquant_mse import (
     quantize_past_key_values_mse,
@@ -178,6 +177,7 @@ def _greedy_decode_with_prefill_cache(
     with torch.inference_mode():
         outputs = model(**inputs, use_cache=True)
         past_key_values = outputs.past_key_values
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         dense_breakdown = past_key_values_memory_breakdown(past_key_values)
         packed_estimate = (
             turboquant_mse_packed_bytes(
@@ -204,19 +204,16 @@ def _greedy_decode_with_prefill_cache(
                 bits=qmse_bits,
                 seed=rotation_seed,
             )
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             del past_key_values
-            del outputs
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             past_key_values = packed_cache
             packed_actual = packed_cache_storage_breakdown(packed_cache)
             quantization_seconds += time.monotonic() - quant_started
         else:
             packed_actual = None
 
-        if variant != "qmse_packed":
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        del outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         generated_tokens = [next_token]
         attention_mask = inputs.get("attention_mask")
 
@@ -354,6 +351,8 @@ def _run_niah_case_impl(
         "cache_quantization_scope": (
             "prefill_full_cache_and_incremental_generated_tail"
             if variant == "qmse"
+            else "packed_prefill_cache_and_incremental_generated_tail"
+            if variant == "qmse_packed"
             else "none"
         ),
         "memory_metrics": memory_metrics,
@@ -1093,7 +1092,6 @@ def main(
     bits: int = 3,
     bits_list: str | None = None,
     target: str = "both",
-    capture_suite: str | None = None,
     niah_context_length: int | None = None,
     niah_depth_percent: float = 50.0,
     niah_grid: bool = False,
@@ -1124,21 +1122,6 @@ def main(
             target=target,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
-        return
-
-    if capture_suite:
-        suite = get_prompt_suite(capture_suite)
-        results = []
-        for index, suite_prompt in enumerate(suite):
-            suite_run_name = f"{capture_suite}-{index:02d}"
-            result = capture_prompt_kv.remote(
-                prompt=suite_prompt,
-                revision=revision,
-                attn_implementation=attn_implementation,
-                run_name=suite_run_name,
-            )
-            results.append(result)
-        print(json.dumps(results, indent=2, sort_keys=True))
         return
 
     if compare_niah_baseline and compare_niah_candidate:
