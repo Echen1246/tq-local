@@ -27,6 +27,14 @@ or
 uv pip install git+https://github.com/Echen1246/tq-local.git
 ```
 
+For local development from this repo:
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+```
+
 ## Library quickstart
 
 ```python
@@ -50,6 +58,55 @@ print(session.last_metrics())
 print(session.last_telemetry())
 print(session.compatibility_report())
 ```
+
+## CLI quickstart
+
+Check whether a model looks compatible:
+
+```bash
+turboquant inspect --model Qwen/QwQ-32B
+```
+
+Run a prompt with packed `3-bit` TurboQuant and print telemetry:
+
+```bash
+turboquant run \
+  --model Qwen/QwQ-32B \
+  --variant qmse_packed \
+  --bits 3 \
+  --prompt "Explain KV cache compression in one paragraph." \
+  --show-telemetry
+```
+
+Run baseline generation for comparison:
+
+```bash
+turboquant run \
+  --model Qwen/QwQ-32B \
+  --variant baseline \
+  --prompt "Explain KV cache compression in one paragraph." \
+  --show-telemetry
+```
+
+Use a prompt file and JSON output:
+
+```bash
+turboquant run \
+  --model /path/to/local/model \
+  --prompt-file ./prompt.txt \
+  --variant qmse_packed \
+  --bits 3 \
+  --json
+```
+
+Useful knobs:
+
+- `--variant baseline|qmse|qmse_packed`
+- `--bits 2|3|4`
+- `--max-new-tokens 256`
+- `--attn-implementation sdpa`
+- `--device-map auto`
+- `--dtype auto`
 
 ## Current library direction
 
