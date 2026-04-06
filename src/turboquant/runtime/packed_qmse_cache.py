@@ -410,6 +410,24 @@ class PackedMSELayer(CacheLayerMixin):
         rotation: torch.Tensor,
         centers: torch.Tensor,
     ) -> torch.Tensor:
+        if packed.packed_indices.is_cuda:
+            try:
+                from turboquant.runtime.triton_kernels import triton_available, triton_decode_group
+
+                if triton_available():
+                    return triton_decode_group(
+                        packed.packed_indices.view(packed.num_vectors, -1),
+                        packed.norms,
+                        rotation,
+                        centers,
+                        packed.bits,
+                        packed.dimension,
+                        packed.original_shape,
+                        packed.original_dtype,
+                    )
+            except Exception:
+                pass
+
         indices = _unpack_indices(
             packed.packed_indices.view(packed.num_vectors, -1),
             packed.bits,

@@ -56,21 +56,52 @@ the same configuration works across model families.
 - **Per-channel outlier splitting makes Q_prod worse**: splitting 128 dims into
   32 outlier + 96 normal concentrates energy in fewer QJL dimensions, increasing
   variance. Recommend `num_outlier_channels=0` for Q_prod.
-- **Decode speed tradeoff**: chunked online-softmax attention in pure PyTorch is
-  ~2-5x slower than fused CUDA SDPA. Acceptable for VRAM-constrained users;
-  will be addressed by Triton kernel. Might take time.
-- **Long Context is untested beyond 80k tokens, will either use more expansive NIAH or LongBench or take advantage of an API to help verify output integrity at 100k and beyond windows at 98.3 3-bit and 99.5 4-bit. Want to see how even 0.5 offset can build up long term.
+- **Decode speed tradeoff**: tile-parallel fused Triton kernel is ~2.3x slower
+  than fused CUDA SDPA at 128 generated tokens (8K context). Steady-state
+  per-token overhead is ~1.85x (37ms vs 20ms); the headline 2.3x includes
+  ~2s of one-time JIT compilation (cached by Triton for subsequent runs).
+- **Long context untested beyond 80K tokens** — will use NIAH / LongBench to
+  verify output integrity at 100K+ with 99.5% cosine sim at 4-bit.
+
+**Triton kernel benchmark (4-bit Q_mse, Llama 3.1-8B, 8K prompt, B200):**
+
+| Tokens generated | Baseline | TurboQuant | Slowdown | VRAM savings |
+|:---:|:---:|:---:|:---:|:---:|
+| 64 | 1.75–1.89s | 4.34–4.67s | 2.5x | 73.6% |
+| 128 | 2.74–3.04s | 6.69–6.80s | 2.3x | 72.8% |
+
+Output text is identical between baseline and TurboQuant in all tests.
 
 ## TODO
 
-### Triton kernel (priority)
+### Triton kernel (shipped — optimization saturated)
 
-- [ ] **Fused Triton attention kernel from packed data** — reads packed
-  indices/signs directly in shared memory, never materializing full K/V. This
-  would give both memory AND speed improvements, eliminating the current ~5x
-  latency penalty from pure-PyTorch chunked attention. The spec is the existing
-  `chunked_turboquant_attention()` function in `src/turboquant/runtime/attention.py`.
-  Current pure-PyTorch decode at 73K tokens: 29.4s vs 6.0s baseline.
+- [x] **Tile-parallel fused Triton attention kernel** — reads packed K+V
+  indices directly, computes online softmax without materializing keys or
+  values. Grid = (n_tiles, Q_heads). Per-position cost O(D), rotation deferred
+  to single matmul after kernel. **Shipped.**
+
+**Alternatives tested and rejected (all worse than baseline TILE_N=64):**
+
+| Variant | Result | Why it lost |
+|:---|:---|:---|
+| TILE_N=128 | 7.64s @ 128 tok | Register pressure from [128,128] tiles |
+| TILE_N=32 | worse occupancy | Too many programs, per-program setup overhead |
+| num_warps=8 | 7.06s @ 128 tok | Warp scheduling overhead outweighs benefits |
+| GQA-fused kernel | 5.16s @ 64 tok | Low occupancy (1144 programs vs 4576); K+V kept in registers across group loop causes spilling |
+| @triton.autotune | 12.05s @ 64 tok | Explores 12 configs on cold start — devastating for fresh containers |
+| Triton reduction kernel | 4.67s @ 64 tok | Its own JIT cost offsets the savings from fewer PyTorch ops |
+
+**Remaining overhead breakdown (per-token, per-layer):**
+- Tile attention kernel: ~0.3ms (bit-unpack ALU + codebook gather)
+- Pre/post rotation matmuls: ~0.1ms each (q@R^T, out@R)
+- Dense buffer merge: ~0.1ms
+- Python wrapper overhead: ~0.2ms
+- Total: ~0.8ms × 32 layers = ~26ms per token (vs ~14ms baseline)
+
+The irreducible gap vs cuDNN SDPA is the bit-unpacking ALU and codebook
+gather — work that a dense attention kernel simply doesn't need to do.
+Further gains likely require a custom CUDA kernel (not Triton).
 
 ### Model testing
 

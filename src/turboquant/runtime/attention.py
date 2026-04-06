@@ -67,17 +67,21 @@ def turboquant_attention_forward(
 
     n_kv_groups = getattr(module, "num_key_value_groups", 1)
 
-    # In lazy mode, update() already stored the new token in the cache
-    # (packed or dense buffer), so we must NOT pass it again as new_key/
-    # new_value — that would double-count it.
-    output = chunked_turboquant_attention(
-        query_states=query,
-        packed_layer=cache_layer,
-        new_key=None,
-        new_value=None,
-        n_kv_groups=n_kv_groups,
-        attention_mask=attention_mask,
-    )
+    # Try fully fused Triton attention first (single kernel for K+V+softmax).
+    try:
+        from turboquant.runtime.triton_kernels import fused_attention
+        output = fused_attention(query, cache_layer, n_kv_groups, attention_mask)
+    except ImportError:
+        output = None
+    if output is None:
+        output = chunked_turboquant_attention(
+            query_states=query,
+            packed_layer=cache_layer,
+            new_key=None,
+            new_value=None,
+            n_kv_groups=n_kv_groups,
+            attention_mask=attention_mask,
+        )
     # chunked_turboquant_attention returns [B, Q_heads, Sq, D]; HF expects [B, Sq, Q_heads, D]
     output = output.transpose(1, 2).contiguous()
     return output, None
@@ -139,6 +143,69 @@ _register_attention_backend()
 _DEFAULT_CHUNK_SIZE = 1024
 
 
+def _try_triton_key_logits(
+    query_states: torch.Tensor,
+    packed_layer: "PackedMSELayer",
+    start: int,
+    end: int,
+    n_kv_groups: int,
+    head_scale: float,
+) -> torch.Tensor | None:
+    """Attempt fused Triton dequant+dot for key logits.
+
+    Returns ``[B, Q, Sq, chunk_len]`` logits, or ``None`` if Triton
+    is unavailable or the path is unsupported (e.g. QJL / outlier keys).
+    """
+    if packed_layer.use_qjl_keys or packed_layer._outlier_enabled:
+        return None
+    if not query_states.is_cuda:
+        return None
+    try:
+        from turboquant.runtime.triton_kernels import triton_available, triton_dequant_dot
+
+        if not triton_available():
+            return None
+    except Exception:
+        return None
+
+    B, Q, Sq, D = query_states.shape
+    KV = packed_layer.keys_packed.original_shape[1]
+    n_groups = Q // KV
+    chunk_len = end - start
+
+    rotation = packed_layer.rotation
+    centers = packed_layer.centers
+    bits = packed_layer.bits
+
+    q_rot = query_states.float() @ rotation.T
+
+    kp_slice = packed_layer._slice_packed(packed_layer.keys_packed, start, end)
+    logits = torch.empty(B, Q, Sq, chunk_len, device=query_states.device, dtype=torch.float32)
+
+    for kv_h in range(KV):
+        head_packed = kp_slice.packed_indices[:, kv_h, :, :].reshape(-1, kp_slice.packed_indices.shape[-1])
+        head_norms = kp_slice.norms[:, kv_h, :].reshape(-1)
+
+        q_start_h = kv_h * n_groups
+        q_end_h = q_start_h + n_groups
+        head_q = q_rot[:, q_start_h:q_end_h, :, :].reshape(-1, D).contiguous()
+
+        dots = triton_dequant_dot(
+            head_packed.contiguous(),
+            head_norms.contiguous(),
+            centers,
+            head_q,
+            bits,
+            D,
+        )
+
+        logits[:, q_start_h:q_end_h, :, :] = (
+            dots.view(B, n_groups, Sq, chunk_len) * head_scale
+        )
+
+    return logits
+
+
 def _online_softmax_update(
     running_max: torch.Tensor,
     running_sum: torch.Tensor,
@@ -198,13 +265,19 @@ def chunked_turboquant_attention(
         for start in range(0, packed_len, chunk_size):
             end = min(start + chunk_size, packed_len)
 
-            keys_chunk = packed_layer._decode_keys_range(start, end)
+            triton_logits = _try_triton_key_logits(
+                query_states, packed_layer, start, end, n_kv_groups, head_scale,
+            )
+            if triton_logits is not None:
+                logits_chunk = triton_logits
+            else:
+                keys_chunk = packed_layer._decode_keys_range(start, end)
+                keys_chunk = _repeat_kv(keys_chunk, n_kv_groups)
+                logits_chunk = (q_float @ keys_chunk.float().transpose(-2, -1)) * head_scale
+                del keys_chunk
+
             vals_chunk = packed_layer._decode_values_range(start, end)
-
-            keys_chunk = _repeat_kv(keys_chunk, n_kv_groups)
             vals_chunk = _repeat_kv(vals_chunk, n_kv_groups)
-
-            logits_chunk = (q_float @ keys_chunk.float().transpose(-2, -1)) * head_scale
 
             if attention_mask is not None:
                 mask_slice = attention_mask[:, :, :, mask_offset:mask_offset + (end - start)]
@@ -214,7 +287,7 @@ def chunked_turboquant_attention(
                 running_max, running_sum, running_output, logits_chunk, vals_chunk,
             )
             mask_offset += (end - start)
-            del keys_chunk, vals_chunk
+            del vals_chunk
 
     # ── Process dense decode buffer ────────────────────────────────
     if packed_layer._dense_keys is not None:

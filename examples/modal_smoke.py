@@ -526,7 +526,7 @@ def main(
             model=model,
             bits=bits,
             prompt_tokens=prompt_tokens,
-            max_new_tokens=16,
+            max_new_tokens=max_new_tokens,
             use_qjl_keys=use_qjl_keys,
             quantize_decode=quantize_decode,
         )
