@@ -96,12 +96,10 @@ def _sdpa_fallback(
     scaling: float | None,
 ) -> tuple[torch.Tensor, None]:
     """Standard SDPA path for prefill or force-dense layers."""
-    n_kv_groups = getattr(module, "num_key_value_groups", 1)
-    if n_kv_groups > 1:
-        key = _repeat_kv(key, n_kv_groups)
-        value = _repeat_kv(value, n_kv_groups)
-
     causal = attention_mask is None and query.shape[-2] > 1
+    n_kv_groups = getattr(module, "num_key_value_groups", 1)
+    use_gqa = n_kv_groups > 1
+
     attn_output = F.scaled_dot_product_attention(
         query,
         key,
@@ -110,6 +108,7 @@ def _sdpa_fallback(
         dropout_p=0.0,
         is_causal=causal,
         scale=scaling,
+        enable_gqa=use_gqa,
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, None
