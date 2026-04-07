@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from turboquant.constants import DEFAULT_MAX_NEW_TOKENS
+
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -257,7 +259,7 @@ class TurboQuantSession:
         *,
         prompt: str | None = None,
         messages: list[dict[str, str]] | None = None,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
         add_generation_prompt: bool = True,
         return_output: bool = False,
     ) -> str | GenerationOutput:
@@ -388,7 +390,7 @@ def activate(
         tq: _TurboQuantState = model._tq_state
         tok = model._tq_tokenizer
 
-        max_new_tokens = kwargs.pop("max_new_tokens", 256)
+        max_new_tokens = kwargs.pop("max_new_tokens", DEFAULT_MAX_NEW_TOKENS)
         attention_mask = kwargs.pop("attention_mask", None)
 
         if input_ids is None:

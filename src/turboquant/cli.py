@@ -15,6 +15,7 @@ from turboquant import (
     load_transformers_model,
 )
 from turboquant.adapters.transformers import TransformersLoadConfig
+from turboquant.constants import DEFAULT_MAX_NEW_TOKENS
 
 _DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 _DEFAULT_BITS = 4
@@ -93,10 +94,13 @@ def _gpu_info() -> dict[str, Any]:
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
+                mem = getattr(props, "total_memory", None)
+                if mem is None:
+                    mem = getattr(props, "total_mem", 0)
                 info["devices"].append({
                     "index": i,
                     "name": props.name,
-                    "total_memory_gb": round(props.total_mem / (1024**3), 1),
+                    "total_memory_gb": round(mem / (1024**3), 1),
                     "compute_capability": f"{props.major}.{props.minor}",
                 })
     except ImportError:
@@ -150,7 +154,8 @@ def _welcome() -> int:
     print(f"      {c['D']}turboquant attach{c['R']}")
     print()
     print(f"  {c['G']}3.{c['R']}  Python API:")
-    print(f"      {c['D']}from turboquant import TurboQuantSession{c['R']}")
+    print(f"      {c['D']}from turboquant import TurboQuantSession
+from turboquant.constants import DEFAULT_MAX_NEW_TOKENS{c['R']}")
     print(f"      {c['D']}s = TurboQuantSession.from_pretrained(\"meta-llama/Llama-3.1-8B-Instruct\"){c['R']}")
     print(f"      {c['D']}print(s.generate(\"Hello\"))  # KV cache auto-compressed{c['R']}")
     print()
@@ -533,7 +538,12 @@ def _add_quant_args(p: argparse.ArgumentParser) -> None:
         help="Keep decode tokens dense (don't re-quantize)",
     )
     p.add_argument("--no-norm-guard", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--max-new-tokens", type=int, default=256, help="Max tokens to generate (default: 256)")
+    p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=DEFAULT_MAX_NEW_TOKENS,
+        help=f"Max tokens to generate (default: {DEFAULT_MAX_NEW_TOKENS})",
+    )
 
 
 # ── Parser ────────────────────────────────────────────────────────
