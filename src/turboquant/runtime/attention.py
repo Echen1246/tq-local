@@ -25,10 +25,6 @@ def _repeat_kv(tensor: torch.Tensor, n_rep: int) -> torch.Tensor:
     return tensor.repeat_interleave(n_rep, dim=1)
 
 
-# ---------------------------------------------------------------------------
-# HF Transformers AttentionInterface integration
-# ---------------------------------------------------------------------------
-
 def turboquant_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -123,10 +119,6 @@ def _register_attention_backend() -> None:
 
 _register_attention_backend()
 
-
-# ---------------------------------------------------------------------------
-# Chunked online-softmax attention (Phase 2 — real peak VRAM savings)
-# ---------------------------------------------------------------------------
 
 _DEFAULT_CHUNK_SIZE = 1024
 
@@ -246,7 +238,7 @@ def chunked_turboquant_attention(
 
     mask_offset = 0
 
-    # ── Process compressed packed history in chunks ────────────────
+    # Process compressed packed history in chunks
     packed_len = packed_layer.packed_seq_length()
     if packed_len > 0:
         for start in range(0, packed_len, chunk_size):
@@ -276,7 +268,7 @@ def chunked_turboquant_attention(
             mask_offset += (end - start)
             del vals_chunk
 
-    # ── Process dense decode buffer ────────────────────────────────
+    # Process dense decode buffer
     if packed_layer._dense_keys is not None:
         dk = _repeat_kv(packed_layer._dense_keys, n_kv_groups)
         dv = _repeat_kv(packed_layer._dense_values, n_kv_groups)
@@ -292,7 +284,7 @@ def chunked_turboquant_attention(
         )
         mask_offset += dense_len
 
-    # ── Process new token (if any) ─────────────────────────────────
+    # Process new token (if any)
     if new_key is not None:
         nk = _repeat_kv(new_key, n_kv_groups)
         nv = _repeat_kv(new_value, n_kv_groups)
@@ -307,6 +299,6 @@ def chunked_turboquant_attention(
             running_max, running_sum, running_output, logits_new, nv,
         )
 
-    # ── Normalize ──────────────────────────────────────────────────
+    # Normalize
     output = running_output / running_sum.clamp(min=1e-8)
     return output.to(dtype=query_states.dtype)

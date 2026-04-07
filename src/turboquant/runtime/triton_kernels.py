@@ -28,10 +28,8 @@ try:
 except ImportError:
     HAS_TRITON = False
 
-
 def triton_available() -> bool:
     return HAS_TRITON
-
 
 if HAS_TRITON:
 
@@ -83,19 +81,6 @@ if HAS_TRITON:
             tl.store(output_ptr + q_id * N + n_id, tl.sum(c * q_vals) * norm)
             q_id += 1
 
-    # ---------------------------------------------------------------
-    # Tile-parallel fused attention kernel
-    #
-    # Grid: (n_tiles, Q)
-    # Each program processes exactly TILE_N positions for one query
-    # head.  Supports both Q_mse (HAS_QJL=False) and Q_prod
-    # (HAS_QJL=True).  When HAS_QJL is False the compiler eliminates
-    # all QJL code so there is zero overhead.
-    #
-    # Q_prod logit per position:
-    #   logit = mse_logit + sqrt(π/2)/D * ||r|| * <q@S^T, signs>
-    # ---------------------------------------------------------------
-
     @triton.jit
     def _tile_attention_kernel(
         key_packed_ptr,
@@ -136,7 +121,7 @@ if HAS_TRITON:
         d_range = tl.arange(0, D)
         kv_off_norm = kv_h * N
 
-        # ── Key logits (MSE component) ────────────────────────────
+        # Key logits (MSE component)
         k_bit_off = d_range * KEY_BITS
         k_byte_idx = k_bit_off // 8
         k_bit_in = k_bit_off % 8
@@ -159,7 +144,7 @@ if HAS_TRITON:
 
         logits = tl.sum(k_c * q_rot[None, :], axis=1) * k_norms * head_scale
 
-        # ── QJL correction (Q_prod) ───────────────────────────────
+        # QJL correction (Q_prod)
         if HAS_QJL:
             kv_off_qjl = kv_h * N * QJL_PACKED_BYTES
             qjl_byte_idx = d_range // 8
@@ -179,12 +164,12 @@ if HAS_TRITON:
 
         logits = tl.where(n_valid, logits, float("-inf"))
 
-        # ── Online softmax ────────────────────────────────────────
+        # Online softmax
         tile_max = tl.max(logits, axis=0)
         exp_logits = tl.exp(logits - tile_max)
         tile_sum = tl.sum(exp_logits, axis=0)
 
-        # ── Value accumulation ────────────────────────────────────
+        # Value accumulation
         v_bit_off = d_range * VAL_BITS
         v_byte_idx = v_bit_off // 8
         v_bit_in = v_bit_off % 8
@@ -206,17 +191,11 @@ if HAS_TRITON:
         weights = exp_logits * v_norms
         tile_out = tl.sum(weights[:, None] * v_c, axis=0)
 
-        # ── Store partials ────────────────────────────────────────
+        # Store partials
         out_offset = query_id * n_tiles * D + tile_id * D
         tl.store(partial_out_ptr + out_offset + d_range, tile_out)
         tl.store(partial_max_ptr + query_id * n_tiles + tile_id, tile_max)
         tl.store(partial_sum_ptr + query_id * n_tiles + tile_id, tile_sum)
-
-
-# -------------------------------------------------------------------
-# Python wrappers
-# -------------------------------------------------------------------
-
 
 def triton_unpack_lookup(
     packed_indices: torch.Tensor, centers: torch.Tensor,
@@ -228,7 +207,6 @@ def triton_unpack_lookup(
     out = torch.empty(N, dim, dtype=torch.float32, device=packed_indices.device)
     _unpack_lookup_kernel[(N,)](packed_indices, centers, out, N, D=dim, BITS=bits, PACKED_BYTES=pb)
     return out
-
 
 def triton_dequant_dot(
     packed_indices: torch.Tensor, norms: torch.Tensor,
@@ -246,7 +224,6 @@ def triton_dequant_dot(
     )
     return out
 
-
 def triton_decode_group(
     packed_indices: torch.Tensor, norms: torch.Tensor,
     rotation: torch.Tensor, centers: torch.Tensor,
@@ -257,7 +234,6 @@ def triton_decode_group(
     coords = triton_unpack_lookup(packed_indices.view(N, -1).contiguous(), centers, bits, dim)
     norms_flat = norms.view(-1).to(torch.float32)
     return ((coords @ rotation) * norms_flat.unsqueeze(1)).view(original_shape).to(original_dtype)
-
 
 def fused_attention(
     query_states: torch.Tensor,

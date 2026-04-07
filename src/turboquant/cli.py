@@ -34,7 +34,6 @@ _TESTED_MODELS = [
     },
 ]
 
-
 def _format_bytes(num_bytes: int | None) -> str:
     if num_bytes is None:
         return "n/a"
@@ -46,10 +45,8 @@ def _format_bytes(num_bytes: int | None) -> str:
         value /= 1024.0
     return f"{num_bytes} B"
 
-
 def _print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
-
 
 def _read_prompt(args) -> str:
     if args.prompt is not None:
@@ -57,7 +54,6 @@ def _read_prompt(args) -> str:
     if getattr(args, "prompt_file", None) is not None:
         return Path(args.prompt_file).read_text()
     raise ValueError("Either --prompt or --prompt-file is required.")
-
 
 def _common_load_kwargs(args) -> dict[str, Any]:
     return {
@@ -70,9 +66,6 @@ def _common_load_kwargs(args) -> dict[str, Any]:
         "cache_dir": getattr(args, "cache_dir", None),
     }
 
-
-# ── Colors ────────────────────────────────────────────────────────
-
 def _colors():
     if not sys.stdout.isatty():
         return {"C": "", "B": "", "D": "", "R": "", "G": "", "Y": ""}
@@ -80,9 +73,6 @@ def _colors():
         "C": "\033[36m", "B": "\033[1m", "D": "\033[2m",
         "R": "\033[0m", "G": "\033[32m", "Y": "\033[33m",
     }
-
-
-# ── GPU detection ─────────────────────────────────────────────────
 
 def _gpu_info() -> dict[str, Any]:
     info: dict[str, Any] = {"cuda_available": False, "devices": []}
@@ -107,7 +97,6 @@ def _gpu_info() -> dict[str, Any]:
         info["torch_version"] = None
     return info
 
-
 def _model_recommendations(vram_gb: float) -> list[str]:
     recs = []
     if vram_gb >= 80:
@@ -121,9 +110,6 @@ def _model_recommendations(vram_gb: float) -> list[str]:
     if not recs:
         recs.append("Consider using Modal/Colab for cloud GPU access")
     return recs
-
-
-# ── Welcome ───────────────────────────────────────────────────────
 
 def _welcome() -> int:
     from turboquant import __version__
@@ -154,8 +140,7 @@ def _welcome() -> int:
     print(f"      {c['D']}turboquant attach{c['R']}")
     print()
     print(f"  {c['G']}3.{c['R']}  Python API:")
-    print(f"      {c['D']}from turboquant import TurboQuantSession
-from turboquant.constants import DEFAULT_MAX_NEW_TOKENS{c['R']}")
+    print(f"      {c['D']}from turboquant import TurboQuantSession{c['R']}")
     print(f"      {c['D']}s = TurboQuantSession.from_pretrained(\"meta-llama/Llama-3.1-8B-Instruct\"){c['R']}")
     print(f"      {c['D']}print(s.generate(\"Hello\"))  # KV cache auto-compressed{c['R']}")
     print()
@@ -202,9 +187,6 @@ from turboquant.constants import DEFAULT_MAX_NEW_TOKENS{c['R']}")
 
     print()
     return 0
-
-
-# ── Setup ─────────────────────────────────────────────────────────
 
 def _handle_setup(args) -> int:
     from turboquant import __version__
@@ -293,9 +275,6 @@ def _handle_setup(args) -> int:
     print()
     return 0
 
-
-# ── Telemetry ─────────────────────────────────────────────────────
-
 def _handle_telemetry(args) -> int:
     path = Path(args.file)
     if not path.exists():
@@ -361,9 +340,6 @@ def _handle_telemetry(args) -> int:
 
     return 0
 
-
-# ── Print telemetry summary inline ────────────────────────────────
-
 def _print_telemetry_summary(telemetry: dict) -> None:
     c = _colors()
     dense = telemetry.get("dense_kv_bytes")
@@ -385,9 +361,6 @@ def _print_telemetry_summary(telemetry: dict) -> None:
 
     if parts:
         print(f"\n{c['D']}[TurboQuant] {' | '.join(parts)}{c['R']}")
-
-
-# ── Attach (interactive REPL) ────────────────────────────────────
 
 def _handle_attach(args) -> int:
     c = _colors()
@@ -471,9 +444,6 @@ def _handle_attach(args) -> int:
 
     return 0
 
-
-# ── Run (one-shot) ────────────────────────────────────────────────
-
 def _handle_run(args) -> int:
     prompt = _read_prompt(args)
     qjl = not args.no_qjl
@@ -513,9 +483,6 @@ def _handle_run(args) -> int:
 
     return 0
 
-
-# ── Shared load args ─────────────────────────────────────────────
-
 def _add_load_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--revision", default=None, help=argparse.SUPPRESS)
     p.add_argument("--dtype", default="auto", help="Model dtype (default: auto)")
@@ -524,7 +491,6 @@ def _add_load_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--trust-remote-code", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--token", default=None, help="HuggingFace token for gated models")
     p.add_argument("--cache-dir", default=None, help=argparse.SUPPRESS)
-
 
 def _add_quant_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
@@ -544,9 +510,6 @@ def _add_quant_args(p: argparse.ArgumentParser) -> None:
         default=DEFAULT_MAX_NEW_TOKENS,
         help=f"Max tokens to generate (default: {DEFAULT_MAX_NEW_TOKENS})",
     )
-
-
-# ── Parser ────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -586,14 +549,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     return parser
 
-
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
         return _welcome()
     return int(args.func(args))
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

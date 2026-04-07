@@ -372,10 +372,6 @@ class PackedMSELayer(CacheLayerMixin):
                 value_states, self.rotation, self.centers, self.boundaries, self.bits,
             )
 
-    # ------------------------------------------------------------------
-    # Low-level encode / decode for a single channel group
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _encode_group(
         tensor: torch.Tensor,
@@ -436,10 +432,6 @@ class PackedMSELayer(CacheLayerMixin):
         rotated = centers[indices]
         reconstructed = (rotated @ rotation) * packed.norms.view(-1).to(dtype=torch.float32).unsqueeze(1)
         return reconstructed.view(packed.original_shape).to(dtype=packed.original_dtype)
-
-    # ------------------------------------------------------------------
-    # Outlier-aware split encode / merge decode
-    # ------------------------------------------------------------------
 
     def _encode_keys_split_qjl(
         self, tensor: torch.Tensor,
@@ -521,10 +513,6 @@ class PackedMSELayer(CacheLayerMixin):
         full[..., self._outlier_indices] = outlier_decoded
         return full
 
-    # ------------------------------------------------------------------
-    # Cache protocol: update
-    # ------------------------------------------------------------------
-
     def _decode_keys_full(self) -> torch.Tensor | None:
         """Decode all stored key vectors, dispatching to the correct path."""
         if self.keys_packed is None:
@@ -550,10 +538,6 @@ class PackedMSELayer(CacheLayerMixin):
         if self._outlier_enabled:
             return self._decode_merge(self.values_packed, self._values_outlier)
         return self._decode_group(self.values_packed, self.rotation, self.centers)
-
-    # ------------------------------------------------------------------
-    # Range decoding for chunked attention
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _slice_packed(packed: PackedTensorMSE, start: int, end: int) -> PackedTensorMSE:
@@ -871,10 +855,6 @@ class PackedMSELayer(CacheLayerMixin):
             torch.cat((previous_keys, key_states), dim=-2),
             torch.cat((previous_values, value_states), dim=-2),
         )
-
-    # ------------------------------------------------------------------
-    # Introspection helpers
-    # ------------------------------------------------------------------
 
     def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
         kv_offset = 0
