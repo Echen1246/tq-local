@@ -31,6 +31,7 @@ mkdir -p $HF_HOME
 ---
 
 ## Vast.ai
+<img width="719" height="465" alt="Screenshot 2026-04-06 at 8 32 54 PM" src="https://github.com/user-attachments/assets/0878b824-f17c-41c0-8e6a-b42f1e4828f6" />
 
 1. Rent a GPU instance at [vast.ai](https://vast.ai) — pick a template
    with PyTorch pre-installed (e.g. "PyTorch 2.x")
