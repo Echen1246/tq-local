@@ -1,4 +1,4 @@
-# TurboQuant
+<img width="246" height="50" alt="Screenshot 2026-04-06 at 8 53 35 PM" src="https://github.com/user-attachments/assets/78510409-d458-40a9-829e-6f59d3c7b2b6" />
 
 KV cache compression for HuggingFace Transformers. Reduces VRAM usage
 by ~74% for long-context inference using DeepMind's TurboQuant algorithm
