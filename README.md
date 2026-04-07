@@ -176,3 +176,15 @@ TurboQuant trades decode speed for VRAM savings.
 - [TurboQuant (ICLR 2026)](https://openreview.net/forum?id=tO3ASKZlok)
 - [QJL](https://arxiv.org/abs/2406.03482)
 - [Google Research blog](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
+
+---
+
+## Footnotes
+
+The math behind TurboQuant is elegant but it isn't model-agnostic in practice. The algorithm assumes that after random rotation, KV coordinates follow a well-behaved distribution that the precomputed Lloyd-Max codebook can quantize cleanly. This holds up on Llama 3.1 and Gemma, where K and V norms sit in a similar range. It breaks down on models with extreme K/V norm asymmetry, like Qwen2.5/QwQ, which has key norms in the hundreds against value norms in the single digits, which amplifies key quantization error disproportionately and produces output collapse on the affected layers. Our Qwen run handles this with a norm guard that keeps 3 of 28 layers in dense FP16. DeepSeek R1 distillations inherit similar pathologies from their base architectures. The community findings in llama.cpp #20969 and the scos-lab benchmarks confirm this is a structural property of the K/V distributions, not a bug in any particular implementation.
+
+I also wan to add: KV cache compression only matters when KV is a meaningful share of total VRAM. On a single user running an 8B model at 2–4K context, model weights dominate the footprint and a 74% KV reduction translates to maybe 10–15% total VRAM saved. The savings show up at long contexts (32K+) where the cache grows linearly and eventually overtakes weights, and in multi-tenant serving where many concurrent caches stack. local-turboquant is a proof-of-concept implementation of the paper; production deployments are better served by the vLLM-integrated forks (0xSero, hackimov) that handle paged attention and request-level batching.
+
+Decode latency unfortunately runs at roughly 2x baseline SDPA. The fused Triton kernel itself is doing the right thing: bit-unpack, codebook lookup, dot product, online softmax, and value accumulation in a single launch on packed bytes, but we can further reduce by shrinking per-call overhead. Rotations, reshapes and softmax reduce as Pytorch ops are currently making decode latency the bottleneck. Using more general-purpose Triton instead of specialized CUDA or cuTile lets up compute cleanly across multiple Nvidia generations and potentially structurally port to AMD/ROCm
+
+~eddie
